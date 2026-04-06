@@ -273,161 +273,137 @@ class ExpertInLoop(_BaseCausalDiscovery):
         return edges_to_remove
 
     def _fit(self, X: pd.DataFrame):
-        """
-        The fitting procedure for the ExpertInLoop algorithm.
-
-        Parameters
-        ----------
-        X : pd.DataFrame
-            The data to learn the causal structure from.
-
-        Returns
-        -------
-        self : ExpertInLoop
-            Returns the instance with the fitted attributes.
-        """
+        """Fit the ExpertInLoop causal discovery algorithm."""
+        from pgmpy.estimators import ExpertKnowledge
+    
         self.variables_ = list(X.columns)
-
-        # Initialize orientation cache (preserve if pre-populated)
-        if not hasattr(self, "orientation_cache_"):
-            self.orientation_cache_ = set()
-
-        # Step 0: Create a new DAG on all the variables with no edge.
+        self.n_iter_ = 0
+    
+        # Initialize or clear caches for fresh fit
+        self.ci_cache_ = {}
+        self.orientation_cache_ = set()
+    
+        # Handle expert knowledge setup
+        if self.expert_knowledge is None:
+            self.expert_knowledge_ = ExpertKnowledge(
+                orientation_fn=self.orientation_fn,
+                orientations=self.orientations,
+            )
+        else:
+            self.expert_knowledge_ = self.expert_knowledge
+            if self.orientation_fn is not None:
+                self.expert_knowledge_.orientation_fn = self.orientation_fn
+            if self.orientations is not None:
+                if isinstance(self.expert_knowledge_.orientations, list):
+                    original_orientations = set(self.expert_knowledge_.orientations)
+                    original_orientations.update(self.orientations)
+                    self.expert_knowledge_.orientations = list(original_orientations)
+                else:
+                    self.expert_knowledge_.orientations.update(self.orientations)
+    
         dag = DAG()
         dag.add_nodes_from(self.variables_)
-
-        # Get the CI test
-        ci_test = get_ci_test(test=self.ci_test, data=X)
-
-        # Initialize blacklisted_edges with forbidden_edges from expert knowledge
-        blacklisted_edges = []
-        if self.expert_knowledge is not None:
-            blacklisted_edges = list(self.expert_knowledge.forbidden_edges)
-            # Add required edges to the DAG
-            if self.expert_knowledge.required_edges:
-                dag.add_edges_from(self.expert_knowledge.required_edges)
-
-        while True:
-            # Step 1: Compute effects and p-values between every combination of variables
-            all_effects = self._test_all(dag=dag, ci_test=ci_test, data=X)
-
-            # Edge case: if only 1 feature, no combinations exist
+    
+        # Robust categorical detection
+        cat_cols = X.select_dtypes(include=["category", "object"]).columns
+        test_param = self.ci_test or ("chi_square" if len(cat_cols) > 0 else None)
+        ci_test = get_ci_test(test=test_param, data=X)
+    
+        blacklisted_edges = list(self.expert_knowledge_.forbidden_edges) if self.expert_knowledge_ else []
+        if self.expert_knowledge_ and self.expert_knowledge_.required_edges:
+            dag.add_edges_from(self.expert_knowledge_.required_edges)
+    
+        while self.n_iter_ < self.max_iter:
+            self.n_iter_ += 1
+            
+            # Build bidirectional blacklist set
+            bl_set_iter = set(blacklisted_edges) | {(v, u) for u, v in blacklisted_edges}
+            all_effects = self._test_all(dag=dag, ci_test=ci_test, data=X, blacklisted=bl_set_iter)
+            
             if all_effects.empty:
                 break
-
-            # Step 2: Remove any edges between variables that are not sufficiently associated
+    
+            # Step 2: Remove weak edges
             edge_effects = all_effects[all_effects.edge_present]
             edge_effects = edge_effects[
                 (edge_effects.effect < self.effect_size_threshold) & (edge_effects.p_val > self.pval_threshold)
             ]
-            remove_edges = list(edge_effects.loc[:, ("u", "v")].to_records(index=False))
+            remove_edges = [tuple(x) for x in edge_effects[["u", "v"]].values]
+    
+            # Protect required edges from removal
+            if self.expert_knowledge_ and self.expert_knowledge_.required_edges:
+                req_set = set(self.expert_knowledge_.required_edges)
+                req_set.update([(v, u) for u, v in self.expert_knowledge_.required_edges])
+                remove_edges = [edge for edge in remove_edges if edge not in req_set]
+    
             for edge in remove_edges:
                 dag.remove_edge(edge[0], edge[1])
-
-            # Step 3: Add edge between variables which have significant association
-            # Step 3.1: Find edges that are not present in the DAG but have significant association
-            nonedge_effects = all_effects[all_effects.edge_present == False]
+    
+            # Step 3: Add strong edges
+            nonedge_effects = all_effects[~all_effects.edge_present]
             nonedge_effects = nonedge_effects[
                 (nonedge_effects.effect >= self.effect_size_threshold) & (nonedge_effects.p_val <= self.pval_threshold)
             ]
-
-            # Step 3.2: Remove any pair of variables that are blacklisted
-            if len(blacklisted_edges) > 0:
-                blacklisted_edges_us = [edge[0] for edge in blacklisted_edges]
-                blacklisted_edges_vs = [edge[1] for edge in blacklisted_edges]
-                nonedge_effects = nonedge_effects.loc[
-                    ~(
-                        (nonedge_effects.u.isin(blacklisted_edges_us) & nonedge_effects.v.isin(blacklisted_edges_vs))
-                        | (nonedge_effects.u.isin(blacklisted_edges_vs) & nonedge_effects.v.isin(blacklisted_edges_us))
-                    ),
-                    :,
-                ]
-
-            # Step 3.3: Exit loop if all correlations in data are explained by the model
-            if (edge_effects.shape[0] == 0) and (nonedge_effects.shape[0] == 0):
-                break
-
-            # If there are only removals and no candidate additions, continue
-            # to the next iteration after having applied removals.
-            if nonedge_effects.shape[0] == 0:
-                continue
-
-            # Step 3.4: Find the pair of variables with the highest effect size
-            selected_edge = nonedge_effects.iloc[nonedge_effects.effect.argmax()]
-            edge_direction = None
-
-            # Step 3.5: Find the edge orientation for the selected pair of variables
-            #
-            # Priority order:
-            # 1. If `orientations` are provided, use them
-            # 2. Check temporal ordering from expert_knowledge
-            # 3. Try to use cached orientations if `use_cache=True`
-            # 4. If no cached orientation, call the orientation_fn
-
-            # Get orientations set (handle None case)
-            orientations_set = self.orientations if self.orientations is not None else set()
-
-            if (selected_edge.u, selected_edge.v) in orientations_set:
-                edge_direction = (selected_edge.u, selected_edge.v)
-            elif (selected_edge.v, selected_edge.u) in orientations_set:
-                edge_direction = (selected_edge.v, selected_edge.u)
-            elif self.expert_knowledge is not None and self.expert_knowledge.temporal_ordering:
-                # Check if temporal order can determine the direction
-                u_order = self.expert_knowledge.temporal_ordering.get(selected_edge.u)
-                v_order = self.expert_knowledge.temporal_ordering.get(selected_edge.v)
-                if u_order is not None and v_order is not None:
-                    if u_order < v_order:
-                        edge_direction = (selected_edge.u, selected_edge.v)
-                    elif v_order < u_order:
-                        edge_direction = (selected_edge.v, selected_edge.u)
-            elif self.use_cache and (selected_edge.u, selected_edge.v) in self.orientation_cache_:
-                edge_direction = (selected_edge.u, selected_edge.v)
-            elif self.use_cache and (selected_edge.v, selected_edge.u) in self.orientation_cache_:
-                edge_direction = (selected_edge.v, selected_edge.u)
-            else:
-                edge_direction = self.orientation_fn(selected_edge.u, selected_edge.v)
-                if self.use_cache is True and edge_direction is not None:
-                    self.orientation_cache_.add(edge_direction)
-
-                if config.SHOW_PROGRESS and self.show_progress and edge_direction is not None:
-                    logger.info(
-                        "\rQueried for edge orientation between "
-                        f"{selected_edge.u} and {selected_edge.v}. Got: "
-                        f"{edge_direction[0]} -> {edge_direction[1]}"
-                    )
-
-            # Step 3.6: Handle the edge direction
-            # 1. If orientation function returns None, do not add the edge
-            # 2. If new edge creates a cycle, try to resolve it
-            # 3. Otherwise, add the edge
-            if edge_direction is None:
-                logger.info(
-                    f"Orientation function returned None for edge {selected_edge.u} - {selected_edge.v}. "
-                    "Skipping this edge."
+    
+            # FIXED: Explicit tuple-based blacklist filtering
+            if len(blacklisted_edges) > 0 and not nonedge_effects.empty:
+                # Use apply with tuple conversion for clarity and correctness
+                mask = nonedge_effects[['u', 'v']].apply(
+                    lambda row: (row['u'], row['v']) in bl_set_iter,
+                    axis=1
                 )
+                nonedge_effects = nonedge_effects[~mask]
+    
+            if nonedge_effects.empty:
+                if edge_effects.empty:
+                    break
+                else:
+                    continue
+    
+            selected_edge = nonedge_effects.iloc[nonedge_effects.effect.argmax()]
+            edge_direction = self._get_edge_orientation(selected_edge.u, selected_edge.v)
+    
+            if edge_direction is None:
+                if self.show_progress or config.SHOW_PROGRESS:
+                    logger.info(
+                        f"Orientation function returned None for edge {selected_edge.u}-{selected_edge.v}. Skipping."
+                    )
                 blacklisted_edges.append((selected_edge.u, selected_edge.v))
             elif nx.has_path(dag, edge_direction[1], edge_direction[0]):
+                if self.show_progress or config.SHOW_PROGRESS:
+                    logger.info("Returned edge orientation creates a cycle. Trying to identify the incorrect edge.")
                 edges_to_remove = self._break_cycle(
-                    dag,
-                    edge_direction[0],
-                    edge_direction[1],
-                    ci_test=ci_test,
-                    data=X,
-                    effect_size_threshold=self.effect_size_threshold,
-                    pval_threshold=self.pval_threshold,
+                    dag, edge_direction[0], edge_direction[1],
+                    ci_test, X,
+                    self.effect_size_threshold, self.pval_threshold,
                 )
-                blacklisted_edges.extend(edges_to_remove)
-                dag.remove_edges_from(edges_to_remove)
-                dag.add_edges_from([(edge_direction[0], edge_direction[1])])
+                if not edges_to_remove:
+                    blacklisted_edges.append(edge_direction)
+                elif edge_direction in edges_to_remove:
+                    if self.show_progress or config.SHOW_PROGRESS:
+                        logger.info(
+                            f"Cycle-breaking subroutine suggested removing the new edge {edge_direction}. Rejecting it."
+                        )
+                    blacklisted_edges.append(edge_direction)
+                else:
+                    blacklisted_edges.extend(edges_to_remove)
+                    dag.remove_edges_from(edges_to_remove)
+                    dag.add_edges_from([edge_direction])
             else:
                 dag.add_edges_from([edge_direction])
-
-        # Set the fitted attributes
+    
+        if self.n_iter_ >= self.max_iter and self.show_progress:
+            logger.warning(
+                f"ExpertInLoop stopped after reaching max_iter={self.max_iter}. "
+                f"Graph may be incomplete. Increase max_iter if needed."
+            )
+    
         self.causal_graph_ = dag
         self.adjacency_matrix_ = pd.DataFrame(
-            nx.adjacency_matrix(dag, nodelist=self.variables_, weight=None).todense(),
+            nx.to_numpy_array(dag, nodelist=self.variables_, dtype=int, weight=None),
             index=self.variables_,
             columns=self.variables_,
         )
-
+        self.n_features_in_ = len(self.variables_)
+        self.feature_names_in_ = np.array(self.variables_)
         return self

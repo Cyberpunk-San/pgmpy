@@ -169,45 +169,63 @@ class ExpertInLoop(_BaseCausalDiscovery):
         self.use_cache = use_cache
         self.show_progress = show_progress
 
-    def _test_all(self, ci_test, dag: DAG, data: pd.DataFrame) -> pd.DataFrame:
+    def _test_all(self, ci_test, dag, data, blacklisted=None):
         """
-        Runs CI tests on all possible combinations of variables in `dag`.
-
+        Runs CI tests on all possible combinations of variables.
+    
+        If blacklisted is provided, skips recording non-edge candidates present
+        in blacklist (either direction), reducing downstream filtering work.
+    
         Parameters
         ----------
         ci_test : callable
             The CI test function to use.
-
-        dag : pgmpy.base.DAG
-            The DAG on which to run the tests.
-
+        dag : DAG
+            The current DAG structure.
         data : pd.DataFrame
-            The data to use for CI testing.
-
+            The data for CI testing.
+        blacklisted : set, optional
+            Set of edges to skip as non-edge candidates.
+    
         Returns
         -------
         pd.DataFrame
-            The results with p-values and effect sizes of all the tests.
+            Results with columns: u, v, z, edge_present, effect, p_val
         """
         cis = []
+        if not hasattr(self, "ci_cache_"):
+            self.ci_cache_ = {}
+    
+        ci_cache = self.ci_cache_
+    
         for u, v in combinations(list(dag.nodes()), 2):
             u_parents = set(dag.get_parents(u))
             v_parents = set(dag.get_parents(v))
-
+    
             if v in u_parents:
-                u_parents -= {v}
+                conditioning_set = u_parents - {v}
                 edge_present = True
             elif u in v_parents:
-                v_parents -= {u}
+                conditioning_set = v_parents - {u}
                 edge_present = True
             else:
+                conditioning_set = u_parents | v_parents
                 edge_present = False
-
-            cond_set = list(set(u_parents).union(v_parents))
-            effect, p_value = ci_test.run_test(X=u, Y=v, Z=cond_set)
-
-            cis.append([u, v, cond_set, edge_present, effect, p_value])
-
+                if blacklisted is not None:
+                    if (u, v) in blacklisted or (v, u) in blacklisted:
+                        continue
+    
+            # FIXED: Keep (u, v) in order to preserve directionality
+            cache_key = (u, v, frozenset(conditioning_set))
+    
+            if cache_key in ci_cache:
+                effect, p_value = ci_cache[cache_key]
+            else:
+                effect, p_value = ci_test.run_test(X=u, Y=v, Z=list(conditioning_set))
+                ci_cache[cache_key] = (effect, p_value)
+    
+            cis.append([u, v, list(conditioning_set), edge_present, effect, p_value])
+    
         return pd.DataFrame(cis, columns=["u", "v", "z", "edge_present", "effect", "p_val"])
 
     def _break_cycle(self, dag, u, v, ci_test, data, effect_size_threshold, pval_threshold):
